@@ -110,6 +110,10 @@ async function locate(p) {
   if (/^georgia$/i.test(state)) state = 'GA';
   const us = isUS(country), attempts = [];
 
+  if (city.trim() == "" && zip.trim() == "") {
+    return null;
+  }
+
   cityKey = `c|${city}|${state}|${country}`.toLowerCase();
   zipKey = `z|${zip}|${country}`.toLowerCase();
 
