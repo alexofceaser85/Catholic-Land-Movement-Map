@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>People Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --ink:#1f2a24; --paper:#f6f7f4; --line:#d5dad2; --accent:#2f6b4f; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--paper); }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); background:#fff; }
+  header h1 { font-size:16px; margin:0 8px 0 0; }
+  button, select { font:inherit; padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  #status { margin-left:auto; color:#5b665f; font-size:13px; }
+  #map { flex:1; min-height:0; }
+  .popup h3 { margin:0 0 2px; font-size:15px; }
+  .popup .meta { color:#5b665f; margin-bottom:6px; }
+  .popup .msg { max-height:110px; overflow:auto; white-space:pre-wrap; margin-top:6px; padding-top:6px; border-top:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>People Map</h1>
+  <button class="primary" id="load">Load CSV</button>
+  <input type="file" id="file" accept=".csv,text/csv" hidden>
+  <select id="filter" aria-label="Filter by status" disabled><option value="">All statuses</option></select>
+  <button id="export" disabled>Export view as PNG</button>
+  <span id="status">Load a CSV to begin.</span>
+</header>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// ---------- Map setup: opens on Georgia, but pans/zooms anywhere ----------
+const GEORGIA_BOUNDS = [[30.36, -85.61], [35.0, -80.84]];
+const map = L.map('map', { zoomSnap: 0.5 }).fitBounds(GEORGIA_BOUNDS);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  crossOrigin: true, // required so the tiles can be drawn onto the export canvas
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+}).addTo(map);
+
+const $ = id => document.getElementById(id);
+const setStatus = t => $('status').textContent = t;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ---------- CSV parsing (handles quotes, commas and newlines inside fields) ----------
+function parseCSV(text) {
+  const rows = []; let row = [], f = '', q = false;
+  text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i+1] === '"') { f += '"'; i++; } else q = false; }
+      else f += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(f); f = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i+1] === '\n') i++;
+      row.push(f); f = ''; rows.push(row); row = [];
+    } else f += c;
+  }
+  if (f || row.length) { row.push(f); rows.push(row); }
+  const head = rows.shift().map(h => h.trim());
+  return rows.filter(r => r.some(v => v.trim())).map(r =>
+    Object.fromEntries(head.map((h, i) => [h, (r[i] ?? '').trim()])));
+}
+
+// ---------- Geocoding (cached in localStorage) ----------
+// US: Zippopotam.us (CORS-friendly, no strict rate limit). Non-US: Nominatim fallback (rate limited).
+let cache = {};
+try { cache = JSON.parse(localStorage.getItem('geo-cache-v2') || '{}'); } catch (e) {}
+const saveCache = () => { try { localStorage.setItem('geo-cache-v2', JSON.stringify(cache)); } catch (e) {} };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const isUS = c => /^(|us|usa|united states|united states of america)$/i.test(c.trim());
+
+function centroid(places) {
+  const pts = places.map(p => [parseFloat(p.latitude), parseFloat(p.longitude)]).filter(p => !isNaN(p[0]));
+  if (!pts.length) return null;
+  return [pts.reduce((a, p) => a + p[0], 0) / pts.length, pts.reduce((a, p) => a + p[1], 0) / pts.length];
+}
+
+// Returns [lat,lng], null (looked up, not found), or throws on a network/rate-limit problem.
+async function zippo(path) {
+  let res;
+  try { res = await fetch('https://api.zippopotam.us/us/' + path); }
+  catch (e) { return undefined; }            // network/CORS hiccup: don't cache
+  if (res.status === 404) return null;
+  if (!res.ok) return undefined;
+  return centroid((await res.json()).places || []);
+}
+
+async function nominatim(q) {
+  const res = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q));
+  if (!res.ok) throw new Error('Geocoder returned ' + res.status);
+  const d = await res.json();
+  return d[0] ? [parseFloat(d[0].lat), parseFloat(d[0].lon)] : null;
+}
+
+// City + state wins; postal code is the fallback.
+async function locate(p) {
+  const country = p['Country'] || 'United States';
+  const city = p['Nearest City/Town'], zip = p['Postal Code'];
+  let state = p['State/Province'];
+  if (/^georgia$/i.test(state)) state = 'GA';
+  const us = isUS(country), attempts = [];
+
+  cityKey = `c|${city}|${state}|${country}`.toLowerCase();
+  zipKey = `z|${zip}|${country}`.toLowerCase();
+
+  if (cache[cityKey]) {
+    return cache[cityKey];
+  }
+
+  if (cache[zipKey] && (!city && !state)) {
+    return cache[zipKey];
+  }
+
+  cords = [];
+
+  if (city && state) {
+    cords = await nominatim(`${city}, ${state}, ${country}`)
+    cache[cityKey] = cords;
+    return cords;
+  }
+  else if (zip) {
+    cords = us ? await zippo(zip.slice(0, 5)) : await nominatim(`${zip}, ${country}`)
+    cache[zipKey] = cords;
+    return cords;
+  }
+
+  return null;
+}
+
+// ---------- Rendering ----------
+const layer = L.layerGroup().addTo(map);
+let records = [];          // { person, latlng, color, marker }
+const palette = ['#2f6b4f', '#c2410c', '#1d4ed8', '#a21caf', '#b45309', '#0f766e', '#be123c', '#4d7c0f'];
+const colorFor = {};
+
+const inGeorgia = p => /^(ga|georgia)$/i.test(p['State/Province']) && /^(us|usa|united states)?$/i.test(p['Country']);
+
+// Small stable offset so people in the same town don't sit exactly on top of each other.
+function jitter(name, [lat, lng]) {
+  let h = 0; for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  const a = (h % 360) * Math.PI / 180, d = 0.004 + (Math.abs(h) % 100) / 100 * 0.01;
+  return [lat + Math.sin(a) * d, lng + Math.cos(a) * d];
+}
+
+function popupHTML(p) {
+  const place = [p['Nearest City/Town'], p['State/Province']].filter(Boolean).join(', ');
+  return `<div class="popup">
+    <h3>${esc(p['Full Name'])}</h3>
+    <div class="meta">${esc(p['Status'])}${place ? ' · ' + esc(place) : ''}${p['Diocese'] ? ' · ' + esc(p['Diocese']) : ''}</div>
+    ${p['Email'] ? `<div><a href="mailto:${esc(p['Email'])}">${esc(p['Email'])}</a></div>` : ''}
+    ${p['Phone Number'] ? `<div>${esc(p['Phone Number'])}</div>` : ''}
+    ${p['Added'] ? `<div class="meta">Added ${esc(p['Added'])}</div>` : ''}
+    ${p['Message'] ? `<div class="msg">${esc(p['Message'])}</div>` : ''}
+    ${p['Notes'] ? `<div class="msg">${esc(p['Notes'])}</div>` : ''}
+  </div>`;
+}
+
+function addRecord(p, latlng) {
+  const status = p['Status'] || 'Unknown';
+  colorFor[status] ??= palette[Object.keys(colorFor).length % palette.length];
+  const color = colorFor[status];
+  const ll = jitter(p['Full Name'] || '', latlng);
+  const marker = L.circleMarker(ll, { radius: 7, color: '#fff', weight: 2, fillColor: color, fillOpacity: 0.95 })
+    .bindPopup(popupHTML(p));
+  records.push({ person: p, latlng: ll, color, marker });
+  marker.addTo(layer);
+}
+
+function refreshFilter() {
+  const sel = $('filter'), cur = sel.value;
+  sel.innerHTML = '<option value="">All statuses</option>' +
+    Object.keys(colorFor).sort().map(s => `<option>${esc(s)}</option>`).join('');
+  sel.value = cur; sel.disabled = false;
+}
+
+function applyFilter() {
+  const s = $('filter').value;
+  layer.clearLayers();
+  records.forEach(r => { if (!s || (r.person['Status'] || 'Unknown') === s) r.marker.addTo(layer); });
+}
+
+async function loadText(text) {
+  layer.clearLayers(); records = []; Object.keys(colorFor).forEach(k => delete colorFor[k]);
+  $('filter').value = '';
+  const people = parseCSV(text).filter(p => p['Full Name']);
+  let done = 0, failed = [], outside = 0;
+  $('export').disabled = false;
+  for (const p of people) {
+    setStatus(`Locating ${++done} of ${people.length}…`);
+    try {
+      const ll = await locate(p);
+      if (ll) { addRecord(p, ll); if (!inGeorgia(p)) outside++; refreshFilter(); }
+      else failed.push(p['Full Name']);
+    } catch (e) { failed.push(p['Full Name']); console.warn(e); await sleep(2000); }
+  }
+  setStatus(`${records.length} mapped` + (outside ? ` (${outside} outside Georgia)` : '') +
+            (failed.length ? `, ${failed.length} not found` : ''));
+  if (failed.length) console.warn('Could not locate:', failed);
+}
+
+$('load').onclick = () => $('file').click();
+$('file').onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  await loadText(await f.text()); e.target.value = '';
+};
+$('filter').onchange = applyFilter;
+
+// ---------- Export: draws only what is inside the current viewport ----------
+$('export').onclick = () => {
+  const box = map.getContainer(), origin = box.getBoundingClientRect();
+  const dpr = 2, canvas = document.createElement('canvas');
+  canvas.width = origin.width * dpr; canvas.height = origin.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = '#e8ebe6'; ctx.fillRect(0, 0, origin.width, origin.height);
+
+  box.querySelectorAll('.leaflet-tile-pane img.leaflet-tile').forEach(img => {
+    if (!img.complete || !img.naturalWidth) return;
+    const r = img.getBoundingClientRect();
+    ctx.drawImage(img, r.left - origin.left, r.top - origin.top, r.width + 0.5, r.height + 0.5);
+  });
+
+  const shown = $('filter').value;
+  records.forEach(r => {
+    if (shown && (r.person['Status'] || 'Unknown') !== shown) return;
+    const pt = map.latLngToContainerPoint(r.latlng);
+    if (pt.x < -10 || pt.y < -10 || pt.x > origin.width + 10 || pt.y > origin.height + 10) return;
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = r.color; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
+  });
+
+  ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'right';
+  const label = '© OpenStreetMap contributors', w = ctx.measureText(label).width;
+  ctx.fillStyle = 'rgba(255,255,255,.8)'; ctx.fillRect(origin.width - w - 12, origin.height - 20, w + 12, 20);
+  ctx.fillStyle = '#333'; ctx.fillText(label, origin.width - 6, origin.height - 6);
+
+  try {
+    canvas.toBlob(b => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b); a.download = 'people-map.png'; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }, 'image/png');
+  } catch (e) { setStatus('Export failed: map tiles were blocked from canvas use.'); }
+};
+</script>
+</body>
+</html>
