@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CLM Chapter Contacts Map</head>title>
+<title>CLM Chapter Contacts Map</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
   :root { --ink:#1f2a24; --paper:#f6f7f4; --line:#d5dad2; --accent:#2f6b4f; }
@@ -36,12 +36,12 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
-// ---------- Map setup: opens on Georgia, but pans/zooms anywhere ----------
+
 const GEORGIA_BOUNDS = [[30.36, -85.61], [35.0, -80.84]];
 const map = L.map('map', { zoomSnap: 0.5 }).fitBounds(GEORGIA_BOUNDS);
 L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
-  crossOrigin: true, // required so the tiles can be drawn onto the export canvas
+  crossOrigin: true,
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 }).addTo(map);
 
@@ -49,7 +49,6 @@ const $ = id => document.getElementById(id);
 const setStatus = t => $('status').textContent = t;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-// ---------- CSV parsing (handles quotes, commas and newlines inside fields) ----------
 function parseCSV(text) {
   const rows = []; let row = [], f = '', q = false;
   text = text.replace(/^\uFEFF/, '');
@@ -71,8 +70,6 @@ function parseCSV(text) {
     Object.fromEntries(head.map((h, i) => [h, (r[i] ?? '').trim()])));
 }
 
-// ---------- Geocoding (cached in localStorage) ----------
-// US: Zippopotam.us (CORS-friendly, no strict rate limit). Non-US: Nominatim fallback (rate limited).
 let cache = {};
 try { cache = JSON.parse(localStorage.getItem('geo-cache-v2') || '{}'); } catch (e) {}
 const saveCache = () => { try { localStorage.setItem('geo-cache-v2', JSON.stringify(cache)); } catch (e) {} };
@@ -85,11 +82,10 @@ function centroid(places) {
   return [pts.reduce((a, p) => a + p[0], 0) / pts.length, pts.reduce((a, p) => a + p[1], 0) / pts.length];
 }
 
-// Returns [lat,lng], null (looked up, not found), or throws on a network/rate-limit problem.
 async function zippo(path) {
   let res;
   try { res = await fetch('https://api.zippopotam.us/us/' + path); }
-  catch (e) { return undefined; }            // network/CORS hiccup: don't cache
+  catch (e) { return undefined; }           
   if (res.status === 404) return null;
   if (!res.ok) return undefined;
   return centroid((await res.json()).places || []);
@@ -102,7 +98,6 @@ async function nominatim(q) {
   return d[0] ? [parseFloat(d[0].lat), parseFloat(d[0].lon)] : null;
 }
 
-// City + state wins; postal code is the fallback.
 async function locate(p) {
   const country = p['Country'] || 'United States';
   const city = p['Nearest City/Town'], zip = p['Postal Code'];
@@ -141,7 +136,6 @@ async function locate(p) {
   return null;
 }
 
-// ---------- Rendering ----------
 const layer = L.layerGroup().addTo(map);
 let records = [];          // { person, latlng, color, marker }
 const palette = ['#2f6b4f', '#c2410c', '#1d4ed8', '#a21caf', '#b45309', '#0f766e', '#be123c', '#4d7c0f'];
@@ -149,7 +143,6 @@ const colorFor = {};
 
 const inGeorgia = p => /^(ga|georgia)$/i.test(p['State/Province']) && /^(us|usa|united states)?$/i.test(p['Country']);
 
-// Small stable offset so people in the same town don't sit exactly on top of each other.
 function jitter(name, [lat, lng]) {
   let h = 0; for (const ch of name) h = (h * 31 + ch.charCodeAt(0)) | 0;
   const a = (h % 360) * Math.PI / 180, d = 0.004 + (Math.abs(h) % 100) / 100 * 0.01;
@@ -219,7 +212,6 @@ $('file').onchange = async e => {
 };
 $('filter').onchange = applyFilter;
 
-// ---------- Export: draws only what is inside the current viewport ----------
 $('export').onclick = () => {
   const box = map.getContainer(), origin = box.getBoundingClientRect();
   const dpr = 2, canvas = document.createElement('canvas');
