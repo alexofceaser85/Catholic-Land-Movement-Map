@@ -28,7 +28,7 @@
   <h1>CLM Chapter Contacts Map</h1>
   <button class="primary" id="load">Load CSV</button>
   <input type="file" id="file" accept=".csv,text/csv" hidden>
-  <select id="state" aria-label="State"></select>
+  <p id="state" aria-label="State">No CSV Loaded</p>
   <select id="filter" aria-label="Filter by status" disabled><option value="">All statuses</option></select>
   <button id="export" disabled>Export view as PNG</button>
   <span id="status">Load a CSV to begin.</span>
@@ -45,6 +45,10 @@ const STATES = `AL:Alabama:30.22,-88.47,35.01,-84.89|AK:Alaska:51.2,-170,71.4,-1
   });
 const US_BOUNDS = [[24.4, -125], [49.4, -66.9]];
 const DEFAULT_STATE = 'GA';
+
+let selectedState = "";
+
+function findSelectedStateInfo() { return STATES.find(s => s.code === selectedState); }
 
 function stateCode(p) {
   const s = (p['State/Province'] || '').trim();
@@ -64,10 +68,6 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
 const $ = id => document.getElementById(id);
 const setStatus = t => $('status').textContent = t;
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-$('state').innerHTML = '<option value="ALL">All locations</option>' +
-  STATES.map(s => `<option value="${s.code}">${s.name}</option>`).join('');
-$('state').value = DEFAULT_STATE;
 
 function parseCSV(text) {
   const rows = []; let row = [], f = '', q = false;
@@ -201,16 +201,13 @@ function applyFilter() {
 
 let people = [], runId = 0;
 
-function selectedState() { return STATES.find(s => s.code === $('state').value); }
-
 async function render() {
   const id = ++runId;                    
-  const st = selectedState();
   layer.clearLayers(); records = [];
   $('filter').value = '';
   if (!people.length) return;
 
-  const subset = people.filter(p => !st || [st.code, ''].includes(stateCode(p)));
+  const subset = people.filter(p => !selectedState || [selectedState, ''].includes(stateCode(p)));
   const elsewhere = people.length - subset.length;
   let done = 0, failed = [], outside = 0;
 
@@ -221,20 +218,19 @@ async function render() {
       const ll = await locate(p);
       if (id !== runId) return;
       if (!ll) { failed.push(p['Full Name']); continue; }
-      if (st && stateCode(p) === '' && !inBounds(ll, st.bounds)) { outside++; continue; }
+      if (selectedState && stateCode(p) === '' && !inBounds(ll, findSelectedStateInfo().bounds)) { outside++; continue; }
       addRecord(p, ll); refreshFilter();
     } catch (e) { failed.push(p['Full Name']); console.warn(e); await sleep(2000); }
   }
   if (id !== runId) return;
-  setStatus(`${records.length} mapped in ${st ? st.name : 'all locations'}` +
+  setStatus(`${records.length} mapped in ${selectedState ? findSelectedStateInfo().name : 'all locations'}` +
             (elsewhere + outside ? ` · ${elsewhere + outside} elsewhere` : '') +
             (failed.length ? ` · ${failed.length} not found` : ''));
   if (failed.length) console.warn('Could not locate:', failed);
 }
 
 $('state').onchange = () => {
-  const st = selectedState();
-  map.fitBounds(st ? st.bounds : US_BOUNDS);
+  map.fitBounds(findSelectedStateInfo() ? findSelectedStateInfo().bounds : US_BOUNDS);
   render();
 };
 
@@ -245,8 +241,27 @@ $('file').onchange = async e => {
   Object.keys(colorFor).forEach(k => delete colorFor[k]);
   $('export').disabled = false;
   e.target.value = '';
+
+  // Pick the state that appears most often in the CSV, then zoom to it.
+  const top = majorityState(people);
+  if (top) {
+    selectedState = top;
+    $('state').textContent = findSelectedStateInfo().name;
+    map.fitBounds(findSelectedStateInfo().bounds);
+  }
   render();
 };
+
+// Most common recognized US state among the rows (blank/unknown states are ignored).
+function majorityState(list) {
+  const counts = {};
+  for (const p of list) {
+    const c = stateCode(p);
+    if (c && c !== '?') counts[c] = (counts[c] || 0) + 1;
+  }
+  const ranked = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  return ranked.length ? ranked[0][0] : null;
+}
 $('filter').onchange = applyFilter;
 
 $('export').onclick = () => {
